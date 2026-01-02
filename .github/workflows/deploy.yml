@@ -1,4 +1,5 @@
-name: SaudaPakka Blue-Green Deploy
+name: SaudaPakka Blue-Green Deployment
+
 on:
   push:
     branches: [ main ]
@@ -11,54 +12,90 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: testpass
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Set up Python
+
+    - name: Set up Python 3.11
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
+
     - name: Install dependencies
       run: |
+        python -m pip install --upgrade pip
         pip install -r requirements.txt
-    
+
     - name: Run Django checks
       env:
-        SECRET_KEY: testkey
+        DATABASE_URL: postgresql://postgres:testpass@localhost:5432/postgres
+        SECRET_KEY: test-secret-key-do-not-use-in-production
+        DEBUG: 'True'
       run: |
-        python manage.py check
+        python manage.py check --deploy
+        python manage.py migrate --check
 
-  build:
+    - name: Run tests
+      env:
+        DATABASE_URL: postgresql://postgres:testpass@localhost:5432/postgres
+        SECRET_KEY: test-secret-key-do-not-use-in-production
+        DEBUG: 'True'
+      run: |
+        python manage.py test
+
+  build-push:
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Log in to GHCR
+
+    - name: Log in to Container Registry
       uses: docker/login-action@v3
       with:
-        registry: ghcr.io
+        registry: ${{ env.REGISTRY }}
         username: ${{ github.actor }}
         password: ${{ secrets.GH_PAT }}
-    
-    - name: Build & push Docker image
+
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=sha
+
+    - name: Build and push Docker image
       uses: docker/build-push-action@v6
       with:
         context: .
         push: true
-        tags: |
-          ghcr.io/${{ github.repository }}:latest
-          ghcr.io/${{ github.repository }}:${{ github.sha }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
   deploy:
-    needs: build
+    needs: build-push
     runs-on: ubuntu-latest
+    environment: production
+
     steps:
     - name: Deploy to VPS (Blue-Green)
       uses: appleboy/ssh-action@v1.0.3
@@ -67,35 +104,58 @@ jobs:
         username: ${{ secrets.VPS_USER }}
         key: ${{ secrets.VPS_SSH_KEY }}
         script: |
+          set -e
+          
           cd /var/www/saudapakka
           
           # Determine inactive environment
-          CURRENT=$(cat active_env)
-          if [ "$CURRENT" == "blue" ]; then
-            TARGET="green"
+          CURRENT_ENV=$(cat active_env 2>/dev/null || echo "blue")
+          if [ "$CURRENT_ENV" == "blue" ]; then
+            DEPLOY_ENV="green"
+            DEPLOY_PORT=8001
           else
-            TARGET="blue"
+            DEPLOY_ENV="blue" 
+            DEPLOY_PORT=8000
           fi
           
-          echo "Current: $CURRENT → Deploying to $TARGET"
+          echo "Current: $CURRENT_ENV | Deploying to: $DEPLOY_ENV (port $DEPLOY_PORT)"
           
-          # Deploy to target environment
-          cd $TARGET
+          # Pull latest image
+          cd $DEPLOY_ENV
+          IMAGE_TAG="${{ github.sha }}"
+          docker pull ghcr.io/${{ github.repository_owner }}/saudapakka-full:$IMAGE_TAG
+          
+          # Stop old container
           docker-compose down || true
-          docker pull ghcr.io/${{ github.repository }}:latest
+          
+          # Start new with migrations
+          export IMAGE_TAG=$IMAGE_TAG
           docker-compose up -d
+          sleep 10
+          
+          # Run migrations
           docker-compose exec -T web python manage.py migrate
           docker-compose exec -T web python manage.py collectstatic --noinput
           
           # Health check
-          sleep 10
-          if curl -f http://127.0.0.1:800${TARGET: -1}/health; then
-            # Switch traffic
-            /var/www/saudapakka/scripts/switch_traffic.sh $TARGET
-            echo "✅ Deployed $TARGET successfully"
+          if curl -f http://localhost:$DEPLOY_PORT/health || curl -f http://localhost:$DEPLOY_PORT/; then
+            echo "$DEPLOY_ENV" > ../active_env
+            ../scripts/switch_traffic.sh $DEPLOY_ENV
+            echo "✅ Deployment successful: $DEPLOY_ENV live!"
           else
             echo "❌ Health check failed, rolling back"
             docker-compose down
             exit 1
           fi
+
+  notify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Notify Deployment Status
+      run: |
+        echo "Deployment ${{ needs.deploy.result }} at ${{ github.sha }}"
+        echo "Check: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/deployments/"
+
 
