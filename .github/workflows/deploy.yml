@@ -178,4 +178,4 @@ jobs:
         status: ${{ job.status }}
         text: '🚀 SaudaPakka Deployment ${{ job.status }}'
       env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} 
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
