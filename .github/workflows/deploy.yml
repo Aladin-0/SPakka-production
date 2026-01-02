@@ -8,11 +8,46 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: production
+    
     steps:
     - uses: actions/checkout@v4
 
-    - name: Deploy to VPS
+    - name: Deploy to VPS (Blue-Green)
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.VPS_HOST }}
-        username: ${{
+        username: ${{ secrets.VPS_USER }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        script: |
+          cd /var/www/saudapakka
+          
+          # Determine inactive environment
+          CURRENT=$(cat active_env 2>/dev/null || echo "blue")
+          if [ "$CURRENT" == "blue" ]; then
+            DEPLOY_TO="green"
+          else
+            DEPLOY_TO="blue"
+          fi
+          
+          echo "Current: $CURRENT, Deploying to: $DEPLOY_TO"
+          
+          # Pull latest code to inactive environment
+          cd $DEPLOY_TO
+          git pull origin main || git clone https://github.com/YOUR_USERNAME/saudapakka-full.git .
+          
+          # Build & start (Django will come later)
+          echo "Deployment to $DEPLOY_TO complete"
+          echo "$DEPLOY_TO" > ../active_env
+          
+          # Reload NGINX
+          /var/www/saudapakka/scripts/switch_traffic.sh $DEPLOY_TO
+          
+          # Health check
+          curl -f http://localhost/health || curl -f http://localhost/health
+          
+          echo "✅ Deployment successful! Active: $DEPLOY_TO"
+
+    - name: Notify Success
+      run: |
+        echo "🚀 SaudaPakka deployed successfully!"
