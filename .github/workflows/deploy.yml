@@ -47,10 +47,12 @@ jobs:
         OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
         REPO_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
         echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/${REPO_LC}" >> $GITHUB_ENV
-        echo "FULL_IMAGE=${OWNER_LC}/${REPO_LC}:${{ github.sha }}" >> $GITHUB_ENV
-        echo "FULL_IMAGE_LATEST=${OWNER_LC}/${REPO_LC}:latest" >> $GITHUB_ENV
-        echo "IMAGE_NAME=$IMAGE_NAME"
-        echo "FULL_IMAGE=$FULL_IMAGE"
+        echo "FULL_IMAGE=ghcr.io/${OWNER_LC}/${REPO_LC}:${{ github.sha }}" >> $GITHUB_ENV
+        echo "FULL_IMAGE_LATEST=ghcr.io/${OWNER_LC}/${REPO_LC}:latest" >> $GITHUB_ENV
+        echo "Image: $FULL_IMAGE"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
 
     - name: Login to GHCR
       uses: docker/login-action@v3
@@ -92,39 +94,28 @@ jobs:
         key: ${{ secrets.VPS_SSH_KEY }}
         script: |
           set -e
-          cd /var/www/saudapakka || mkdir -p /var/www/saudapakka && cd /var/www/saudapakka
+          cd /var/www/saudapakka || { mkdir -p /var/www/saudapakka && cd /var/www/saudapakka; }
           
-          # Read current active env (create if missing)
           if [ ! -f active_env ]; then echo "blue" > active_env; fi
           ACTIVE=$(cat active_env)
           INACTIVE=$([ "$ACTIVE" = "blue" ] && echo "green" || echo "blue")
           NEW_PORT=$([ "$INACTIVE" = "blue" ] && echo "8000" || echo "8001")
           
-          echo "🚀 Deploying to $INACTIVE (port $NEW_PORT), active was: $ACTIVE"
+          echo "🚀 Deploying $FULL_IMAGE_LATEST to $INACTIVE (port $NEW_PORT)"
           
-          # Pull latest image
           docker pull $FULL_IMAGE_LATEST
           
-          # Stop & remove old inactive containers/volumes
-          docker-compose -f docker-compose.$INACTIVE.yml down -v || true
+          docker-compose -f docker-compose.$INACTIVE.yml down || true
           
-          # Start new inactive env (assumes docker-compose.$INACTIVE.yml exists)
-          IMAGE=$FULL_IMAGE_LATEST docker-compose -f docker-compose.$INACTIVE.yml up -d --build
+          IMAGE=$FULL_IMAGE_LATEST docker-compose -f docker-compose.$INACTIVE.yml up -d
           
-          # Wait & health check
           for i in {1..60}; do
-            if timeout 2 bash -c "curl -f http://localhost:$NEW_PORT/health || exit 1"; then
-              echo "✅ $INACTIVE healthy after $i*10s"
-              break
+            if timeout 5 bash -c '</dev/tcp/localhost/$NEW_PORT' 2>/dev/null; then
+              curl -f http://localhost:$NEW_PORT/health >/dev/null 2>&1 && break
             fi
             sleep 10
-          done || { echo "❌ Health check failed"; exit 1; }
+          done || { echo "❌ Health failed"; exit 1; }
           
-          # Smoke test API endpoints
-          curl -f http://localhost:$NEW_PORT/ || echo "⚠️ Root ok, some endpoints WIP"
-          
-          # Switch traffic if healthy
-          mv active_env active_env.old
           echo "$INACTIVE" > active_env
           nginx -t && systemctl reload nginx
-          echo "🎉 Traffic switched to $INACTIVE! Rollback: mv active_env.old active_env && systemctl reload nginx"
+          echo "🎉 Live on $INACTIVE! Rollback: echo $ACTIVE > active_env && systemctl reload nginx"
