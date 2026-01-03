@@ -4,6 +4,11 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
 
 env:
   REGISTRY: ghcr.io
@@ -18,11 +23,6 @@ jobs:
           POSTGRES_DB: saudapakka_test
           POSTGRES_USER: deploy
           POSTGRES_PASSWORD: testpass
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
         ports:
           - 5432:5432
 
@@ -35,40 +35,34 @@ jobs:
         python-version: '3.11'
 
     - name: Lint & Test
-      env:
-        DATABASE_URL: postgresql://deploy:testpass@localhost:5432/saudapakka_test
       run: |
         pip install ruff pytest || true
         ruff check . || true
-        pytest --cov || echo "Tests WIP - continuing"
+        pytest || echo "Tests WIP"
 
-    - name: Lowercase repo owner for GHCR
+    - name: Lowercase image name
+      id: lowercase
       run: |
         OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
         REPO_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
-        echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/${REPO_LC}" >> $GITHUB_ENV
-        echo "FULL_IMAGE=ghcr.io/${OWNER_LC}/${REPO_LC}:${{ github.sha }}" >> $GITHUB_ENV
-        echo "FULL_IMAGE_LATEST=ghcr.io/${OWNER_LC}/${REPO_LC}:latest" >> $GITHUB_ENV
-        echo "Image: $FULL_IMAGE"
+        echo "FULL_IMAGE=ghcr.io/${OWNER_LC}/${REPO_LC}:${{ github.sha }}" >> $GITHUB_OUTPUT
+        echo "FULL_IMAGE_LATEST=ghcr.io/${OWNER_LC}/${REPO_LC}:latest" >> $GITHUB_OUTPUT
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Login to GHCR
+    - name: Log in to GHCR
       uses: docker/login-action@v3
       with:
-        registry: ghcr.io
+        registry: ${{ env.REGISTRY }}
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build & Push Docker
+    - name: Build & Push
       uses: docker/build-push-action@v6
       with:
         context: .
         push: true
         tags: |
-          ${{ env.FULL_IMAGE }}
-          ${{ env.FULL_IMAGE_LATEST }}
+          ${{ steps.lowercase.outputs.FULL_IMAGE }}
+          ${{ steps.lowercase.outputs.FULL_IMAGE_LATEST }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
@@ -78,45 +72,97 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Lowercase repo owner for GHCR (deploy)
+    - name: Lowercase image name (deploy)
+      id: lowercase-deploy
       run: |
         OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
         REPO_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
-        echo "FULL_IMAGE_LATEST=ghcr.io/${OWNER_LC}/${REPO_LC}:latest" >> $GITHUB_ENV
+        echo "FULL_IMAGE_LATEST=ghcr.io/${OWNER_LC}/${REPO_LC}:latest" >> $GITHUB_OUTPUT
 
     - name: Deploy to VPS
       uses: appleboy/ssh-action@v1.0.3
-      env:
-        FULL_IMAGE_LATEST: ${{ env.FULL_IMAGE_LATEST }}
       with:
         host: ${{ secrets.VPS_HOST }}
         username: root
-        key: ${{ secrets.VPS_SSH_KEY }}
-        key_no_newline: false 
+        password: ${{ secrets.VPS_PASSWORD }}
+        port: 22
+        timeout: 120s
+        command_timeout: 30m
         script: |
           set -e
+          
           cd /var/www/saudapakka || { mkdir -p /var/www/saudapakka && cd /var/www/saudapakka; }
           
           if [ ! -f active_env ]; then echo "blue" > active_env; fi
+          
           ACTIVE=$(cat active_env)
           INACTIVE=$([ "$ACTIVE" = "blue" ] && echo "green" || echo "blue")
           NEW_PORT=$([ "$INACTIVE" = "blue" ] && echo "8000" || echo "8001")
           
-          echo "🚀 Deploying $FULL_IMAGE_LATEST to $INACTIVE (port $NEW_PORT)"
+          echo "================================================"
+          echo "🚀 SAUDAPAKKA BLUE-GREEN DEPLOYMENT"
+          echo "================================================"
+          echo "Current Active: $ACTIVE"
+          echo "Deploying to: $INACTIVE (port $NEW_PORT)"
+          echo "Image: ${{ steps.lowercase-deploy.outputs.FULL_IMAGE_LATEST }}"
+          echo "================================================"
           
-          docker pull $FULL_IMAGE_LATEST
+          # Pull latest image
+          echo "📦 Pulling Docker image..."
+          docker pull ${{ steps.lowercase-deploy.outputs.FULL_IMAGE_LATEST }}
           
+          # Stop & remove old inactive containers
+          echo "🛑 Stopping old $INACTIVE environment..."
           docker-compose -f docker-compose.$INACTIVE.yml down || true
           
-          IMAGE=$FULL_IMAGE_LATEST docker-compose -f docker-compose.$INACTIVE.yml up -d
+          # Start new inactive env
+          echo "🚀 Starting new $INACTIVE environment..."
+          IMAGE=${{ steps.lowercase-deploy.outputs.FULL_IMAGE_LATEST }} docker-compose -f docker-compose.$INACTIVE.yml up -d
           
+          # Wait for containers to be ready
+          echo "⏳ Waiting for containers to start..."
+          sleep 5
+          
+          # Health check loop
+          echo "🏥 Running health checks..."
+          HEALTH_CHECK_PASSED=0
           for i in {1..60}; do
-            if timeout 5 bash -c '</dev/tcp/localhost/$NEW_PORT' 2>/dev/null; then
-              curl -f http://localhost:$NEW_PORT/health >/dev/null 2>&1 && break
+            if timeout 5 bash -c "</dev/tcp/localhost/$NEW_PORT" 2>/dev/null; then
+              if curl -f http://localhost:$NEW_PORT/health >/dev/null 2>&1; then
+                echo "✅ Health check passed (attempt $i)"
+                HEALTH_CHECK_PASSED=1
+                break
+              fi
             fi
+            echo "⏳ Health check attempt $i/60 - waiting..."
             sleep 10
-          done || { echo "❌ Health failed"; exit 1; }
+          done
           
+          if [ $HEALTH_CHECK_PASSED -eq 0 ]; then
+            echo "❌ Health check FAILED after 600s"
+            docker-compose -f docker-compose.$INACTIVE.yml logs
+            exit 1
+          fi
+          
+          # Switch traffic
+          echo "🔄 Switching traffic from $ACTIVE to $INACTIVE..."
+          mv active_env active_env.backup
           echo "$INACTIVE" > active_env
+          
+          # Reload NGINX
+          echo "🔄 Reloading NGINX..."
           nginx -t && systemctl reload nginx
-          echo "🎉 Live on $INACTIVE! Rollback: echo $ACTIVE > active_env && systemctl reload nginx"
+          
+          echo "================================================"
+          echo "🎉 DEPLOYMENT SUCCESSFUL!"
+          echo "================================================"
+          echo "Active environment: $(cat active_env)"
+          echo "Inactive (standby): $ACTIVE"
+          echo "🌐 Service: http://${{ secrets.VPS_HOST }}"
+          echo ""
+          echo "📊 Status:"
+          docker ps --filter "name=saudapakka" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+          echo ""
+          echo "🔙 Rollback command (if needed):"
+          echo "   echo $ACTIVE > /var/www/saudapakka/active_env && systemctl reload nginx"
+          echo "================================================"
